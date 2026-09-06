@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         X(Twitter) Filter Enhanced 4.1 Fixed
-// @namespace    https://github.com/ShiYuPIay
-// @version      4.1.1
+// @name         X-Twitter-intercept-Malicious-advertising.user.js
+// @namespace    https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main 
+// @version      1.0.0
 // @description  X/Twitter spam filter, bot detection, ad blocking and scam detection — fixed edition
 // @author       Via && ShiYuPIay
 // @license      MIT
