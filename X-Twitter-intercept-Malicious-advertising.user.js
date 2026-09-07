@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         X Ad Blocker
+// @name         X-Twitter-intercept-Malicious-advertising.user.js
 // @name:zh-CN   X 广告拦截
-// @namespace    https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main 
-// @version      1.3.0
+// @namespace    https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main
+// @version      1.3.1
 // @description  Blocks promoted posts, spam, and scams on X/Twitter
 // @description:zh-CN  拦截 X/Twitter 推广、垃圾内容和诈骗帖
 // @author       Via && ShiYuPIay
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 /*
- * X Ad Blocker 1.3.0: performance-oriented tweet/ad filtering with configurable
+ * X Ad Blocker 1.3.1: performance-oriented tweet/ad filtering with configurable
  * trusted-user rules and an opt-in, page-context sensitive-content fetch patch.
  */
 
