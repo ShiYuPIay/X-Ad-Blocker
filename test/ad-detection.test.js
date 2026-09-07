@@ -245,3 +245,24 @@ test('settings describe sensitive-content modification as best effort', () => {
     assert.match(source, /尝试修改部分 X API fetch 响应；X 的请求实现变化时可能无效/);
     assert.doesNotMatch(source, /XMLHttpRequest/);
 });
+
+test('userscript branding selects concise Chinese or English copy from browser language', () => {
+    const source = fs.readFileSync(
+        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
+        'utf8'
+    );
+
+    const start = source.indexOf('    const UI_COPY =');
+    const end = source.indexOf('    const Storage =', start);
+    assert.notEqual(start, -1, 'UI copy should be declared');
+    assert.notEqual(end, -1, 'UI copy should precede storage setup');
+    const getUiText = new Function('navigator', `${source.slice(start, end)} return getUiText;`)({ languages: ['en-US'] });
+
+    assert.equal(getUiText(['zh-CN']).name, 'X 广告拦截');
+    assert.equal(getUiText(['zh-TW']).description, '屏蔽推广、垃圾内容和诈骗帖');
+    assert.equal(getUiText(['en-US']).name, 'X Ad Blocker');
+    assert.match(getUiText(['en-GB']).openSettings, /Open X Ad Blocker settings/);
+    assert.match(source, /@name:zh-CN\s+X 广告拦截/);
+    assert.match(source, /@name\s+X Ad Blocker/);
+    assert.match(source, /<svg class="brand-icon"/);
+});
