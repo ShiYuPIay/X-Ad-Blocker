@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         X-Twitter-intercept-Malicious-advertising.user.js
 // @namespace    https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main 
-// @version      1.0.0
+// @version      1.1.0
 // @description  X/Twitter spam filter, bot detection, ad blocking and scam detection — fixed edition
+// @compatible    Chrome 80+, Firefox 74+, Safari 13.1+ (optional chaining support required)
 // @author       Via && ShiYuPIay
 // @license      MIT
 // @match        https://x.com/*
@@ -112,7 +113,7 @@
     // ─────────────────────────────────────────────
 
     let CONFIG = Object.assign(
-        { users: [], words: [], disabledUsers: [], disabledWords: [] },
+        { users: [], words: [], trustedUsers: [], disabledUsers: [], disabledWords: [], unlockSensitive: true },
         Storage.get("XFilterConfig", {})
     );
 
@@ -121,16 +122,23 @@
     // ─────────────────────────────────────────────
 
     const TextCache = new Map();
-    const CACHE_LIMIT = 3000;
+    const CACHE_LIMIT = 5000;
 
     function cacheSet(map, key, value) {
+        // Map insertion order makes this a compact LRU cache: refreshing a key
+        // moves it to the end and eviction always removes the least-recent entry.
+        if (map.has(key)) map.delete(key);
         map.set(key, value);
         if (map.size > CACHE_LIMIT) map.delete(map.keys().next().value);
     }
 
     function cleanText(text) {
         if (!text) return "";
-        if (TextCache.has(text)) return TextCache.get(text);
+        if (TextCache.has(text)) {
+            const cached = TextCache.get(text);
+            cacheSet(TextCache, text, cached);
+            return cached;
+        }
         const result = text.replace(/[\u200B-\u200F\uFEFF\u2060]/g, "").trim();
         cacheSet(TextCache, text, result);
         return result;
@@ -178,7 +186,7 @@
     //  Risk scoring — FIX: was defined but never called; now used by shouldFilter
     // ─────────────────────────────────────────────
 
-    const SPAM_THRESHOLD = 40;
+    const SPAM_THRESHOLD = 60;
 
     function spamScore(data) {
         let score = 0;
@@ -197,9 +205,10 @@
 
     const ProcessedTweets = new WeakSet();
     const TweetCache = new Map();
-    const MAX_TWEET_CACHE = 5000;
+    const MAX_TWEET_CACHE = 8000;
 
     function cacheTweet(id, value) {
+        if (TweetCache.has(id)) TweetCache.delete(id);
         TweetCache.set(id, value);
         if (TweetCache.size > MAX_TWEET_CACHE) {
             TweetCache.delete(TweetCache.keys().next().value);
@@ -210,16 +219,33 @@
     //  User blocklist check
     // ─────────────────────────────────────────────
 
+    function normalizeUserRule(value) {
+        return String(value || "").trim().toLowerCase().replace(/^@/, "");
+    }
+
+    function userMatchesRule(user, rule) {
+        const normalizedUser = normalizeUserRule(user);
+        const normalizedRule = normalizeUserRule(rule);
+        if (!normalizedUser || !normalizedRule) return false;
+        if (normalizedRule.length > 2 && normalizedRule[0] === "/" && normalizedRule.lastIndexOf("/") > 0) {
+            const lastSlash = normalizedRule.lastIndexOf("/");
+            try {
+                return new RegExp(normalizedRule.slice(1, lastSlash), normalizedRule.slice(lastSlash + 1)).test(normalizedUser);
+            } catch (e) { return false; }
+        }
+        return normalizedUser === normalizedRule;
+    }
+
     function checkUser(userId, userName) {
         if (!userId && !userName) return false;
         const list = [...DEFAULT_RULES.users, ...CONFIG.users];
-        const uid  = (userId   || "").toLowerCase();
-        const name = (userName || "").toLowerCase();
-        for (const rule of list) {
-            const r = rule.toLowerCase();
-            if (uid.includes(r) || name.includes(r)) return true;
-        }
-        return false;
+        return list.some(rule => userMatchesRule(userId, rule) || userMatchesRule(userName, rule));
+    }
+
+    function isTrustedUser(userId, userName) {
+        return (CONFIG.trustedUsers || []).some(rule =>
+            userMatchesRule(userId, rule) || userMatchesRule(userName, rule)
+        );
     }
 
     // ─────────────────────────────────────────────
@@ -252,10 +278,10 @@
 
     function parseTweet(tweet) {
         const textNode = tweet.querySelector('[data-testid="tweetText"]');
-        const text     = cleanText(textNode?.innerText || "");
+        const text     = cleanText(textNode ? textNode.innerText : "");
 
         const userNode = tweet.querySelector('[data-testid="User-Name"]');
-        const userName = cleanText(userNode?.innerText.split("\n")[0] || "");
+        const userName = cleanText(userNode ? userNode.innerText.split("\n")[0] : "");
 
         const avatar = tweet.querySelector('[data-testid^="UserAvatar"]');
         const userId = avatar
@@ -263,7 +289,8 @@
             : "";
 
         const link = tweet.querySelector('a[href*="/status/"]');
-        const id   = link ? link.href.split("/status/")[1]?.split("?")[0] : "";
+        const statusPart = link ? link.href.split("/status/")[1] : "";
+        const id   = statusPart ? statusPart.split("?")[0] : "";
 
         return { id, text, userName, userId };
     }
@@ -278,12 +305,18 @@
         if (!data.text && !data.userName) return false;
 
         const key = data.id || data.text;
-        if (TweetCache.has(key)) return TweetCache.get(key);
+        if (TweetCache.has(key)) {
+            const cached = TweetCache.get(key);
+            cacheTweet(key, cached);
+            return cached;
+        }
 
-        const result =
+        const trusted = isTrustedUser(data.userId, data.userName);
+        const result = !trusted && (
             checkUser(data.userId, data.userName) ||
-            spamScore(data) >= SPAM_THRESHOLD     ||
-            detectBot(data.text, data.userName);
+            spamScore(data) >= SPAM_THRESHOLD ||
+            detectBot(data.text, data.userName)
+        );
 
         cacheTweet(key, result);
         return result;
@@ -338,9 +371,9 @@
 
     const AD_SELECTORS = [
         '[data-testid="placementTracking"]',
-        'div[aria-label="Promoted"]',
-        'div[aria-label="广告"]',
-        'div[aria-label="Sponsored"]'
+        '[data-testid="socialContext"][aria-label="Promoted"]',
+        '[data-testid="socialContext"][aria-label="广告"]',
+        '[data-testid="socialContext"][aria-label="Sponsored"]'
     ];
 
     function hideAdNode(el) {
@@ -355,7 +388,7 @@
         const search = root || document;
         for (const selector of AD_SELECTORS) {
             try {
-                if (root?.matches?.(selector)) hideAdNode(root);
+                if (root && root.matches && root.matches(selector)) hideAdNode(root);
                 search.querySelectorAll(selector).forEach(hideAdNode);
             } catch (e) {}
         }
@@ -374,7 +407,7 @@
                 for (const node of addedNodes) {
                     if (node.nodeType !== 1) continue;
 
-                    if (node.matches?.('article[data-testid="tweet"]')) {
+                    if (node.matches && node.matches('article[data-testid="tweet"]')) {
                         addQueue(node);
                     } else {
                         node.querySelectorAll?.('article[data-testid="tweet"]')
@@ -384,7 +417,7 @@
                     cleanAds(node);
                 }
             }
-        }).observe(target, { childList: true, subtree: true });
+        }).observe(target, { childList: true, subtree: false });
     }
 
     // ─────────────────────────────────────────────
@@ -404,7 +437,19 @@
     //       third-party requests). Now scoped to api.twitter.com / api.x.com.
     // ─────────────────────────────────────────────
 
+    const ResponsePatchCache = new Map();
+    const RESPONSE_CACHE_LIMIT = 100;
+
+    function cachePatchedResponse(key, source, patched) {
+        if (ResponsePatchCache.has(key)) ResponsePatchCache.delete(key);
+        ResponsePatchCache.set(key, { source, patched });
+        if (ResponsePatchCache.size > RESPONSE_CACHE_LIMIT) {
+            ResponsePatchCache.delete(ResponsePatchCache.keys().next().value);
+        }
+    }
+
     function unlockSensitive() {
+        if (!CONFIG.unlockSensitive) return;
         const originalFetch = window.fetch;
         window.fetch = function (...args) {
             return originalFetch.apply(this, args).then(async response => {
@@ -417,10 +462,11 @@
                 try {
                     const text = await response.clone().text();
                     if (!text.includes('"possibly_sensitive":true')) return response;
-                    const patched = text.replace(
-                        /"possibly_sensitive":true/g,
-                        '"possibly_sensitive":false'
-                    );
+                    const cached = ResponsePatchCache.get(url);
+                    const patched = cached && cached.source === text
+                        ? cached.patched
+                        : text.replace(/"possibly_sensitive":true/g, '"possibly_sensitive":false');
+                    if (!cached || cached.source !== text) cachePatchedResponse(url, text, patched);
                     return new Response(patched, {
                         status:     response.status,
                         statusText: response.statusText,
@@ -446,7 +492,7 @@
         const style = document.createElement("style");
         style.textContent = `
             #button {
-                position: fixed; right: 20px; bottom: 120px;
+                position: fixed; right: 20px; top: 76px;
                 width: 45px; height: 45px; border-radius: 50%;
                 background: #1d9bf0; color: white;
                 display: flex; align-items: center; justify-content: center;
@@ -457,7 +503,7 @@
             #button:hover { background: #1a8cd8; }
             #panel {
                 display: none; position: fixed;
-                right: 20px; bottom: 180px; width: 350px;
+                right: 20px; top: 130px; width: 350px;
                 background: white; color: #111;
                 border-radius: 16px; padding: 20px;
                 box-shadow: 0 10px 40px rgba(0,0,0,.25);
@@ -474,7 +520,7 @@
                 margin-top: 5px; margin-right: 4px; font-size: 13px;
             }
             button:hover { background: #1a8cd8; }
-            h3 { margin-top: 0; }
+            h3 { margin-top: 0; cursor: move; }
             p  { margin: 8px 0 4px; font-size: 13px; }
         `;
         shadow.appendChild(style);
@@ -483,11 +529,14 @@
         wrap.innerHTML = `
             <div id="button">⚙</div>
             <div id="panel">
-                <h3>X Filter 4.1</h3>
-                <p>屏蔽用户（每行一个）</p>
+                <h3 id="title">X Filter 4.1</h3>
+                <p>屏蔽用户（每行一个；支持精确用户名或 <code>/正则/</code>）</p>
                 <textarea id="users"></textarea>
+                <p>信任用户（每行一个，不会被此脚本隐藏）</p>
+                <textarea id="trusted-users"></textarea>
                 <p>屏蔽关键词（每行一个）</p>
                 <textarea id="words"></textarea>
+                <p><label><input id="unlock-sensitive" type="checkbox"> 解锁敏感内容（拦截 X API fetch）</label></p>
                 <div>
                     <button id="save">保存规则</button>
                     <button id="export">导出规则</button>
@@ -500,10 +549,21 @@
         const btn   = shadow.querySelector("#button");
         const panel = shadow.querySelector("#panel");
         const users = shadow.querySelector("#users");
+        const trustedUsers = shadow.querySelector("#trusted-users");
         const words = shadow.querySelector("#words");
+        const unlockSensitiveCheckbox = shadow.querySelector("#unlock-sensitive");
 
         users.value = CONFIG.users.join("\n");
+        trustedUsers.value = (CONFIG.trustedUsers || []).join("\n");
         words.value = CONFIG.words.join("\n");
+        unlockSensitiveCheckbox.checked = CONFIG.unlockSensitive !== false;
+
+        const savedPosition = Storage.get("XFilterPanelPosition", null);
+        if (savedPosition && Number.isFinite(savedPosition.left) && Number.isFinite(savedPosition.top)) {
+            panel.style.left = savedPosition.left + "px";
+            panel.style.top = savedPosition.top + "px";
+            panel.style.right = "auto";
+        }
 
         btn.onclick = () => {
             panel.style.display = panel.style.display === "block" ? "none" : "block";
@@ -511,10 +571,13 @@
 
         shadow.querySelector("#save").onclick = () => {
             CONFIG.users = users.value.split("\n").map(x => x.trim()).filter(Boolean);
+            CONFIG.trustedUsers = trustedUsers.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.words = words.value.split("\n").map(x => x.trim()).filter(Boolean);
+            CONFIG.unlockSensitive = unlockSensitiveCheckbox.checked;
             Storage.set("XFilterConfig", CONFIG);
             Keyword.reload();
-            alert("规则已保存");
+            TweetCache.clear();
+            alert("规则已保存。敏感内容拦截开关会在下次页面加载时生效。");
         };
 
         shadow.querySelector("#export").onclick = () => {
@@ -524,11 +587,33 @@
 
         shadow.querySelector("#reset").onclick = () => {
             if (confirm("恢复默认规则？自定义规则将被清除。")) {
-                CONFIG = { users: [], words: [], disabledUsers: [], disabledWords: [] };
+                CONFIG = { users: [], words: [], trustedUsers: [], disabledUsers: [], disabledWords: [], unlockSensitive: true };
                 Storage.set("XFilterConfig", CONFIG);
                 location.reload();
             }
         };
+
+        let dragOffset = null;
+        shadow.querySelector("#title").addEventListener("pointerdown", event => {
+            const bounds = panel.getBoundingClientRect();
+            dragOffset = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+            event.currentTarget.setPointerCapture(event.pointerId);
+        });
+        shadow.querySelector("#title").addEventListener("pointermove", event => {
+            if (!dragOffset) return;
+            const left = Math.max(0, Math.min(window.innerWidth - panel.offsetWidth, event.clientX - dragOffset.x));
+            const top = Math.max(0, Math.min(window.innerHeight - panel.offsetHeight, event.clientY - dragOffset.y));
+            panel.style.left = left + "px";
+            panel.style.top = top + "px";
+            panel.style.right = "auto";
+        });
+        shadow.querySelector("#title").addEventListener("pointerup", () => {
+            if (!dragOffset) return;
+            Storage.set("XFilterPanelPosition", {
+                left: parseInt(panel.style.left, 10), top: parseInt(panel.style.top, 10)
+            });
+            dragOffset = null;
+        });
 
         document.body.appendChild(box);
     }
@@ -538,22 +623,21 @@
     // ─────────────────────────────────────────────
 
     function boot() {
-        const ready = setInterval(() => {
-            if (document.querySelector("main")) {
-                clearInterval(ready);
-                createPanel();
-                initialScan();
-                startObserver();
-                unlockSensitive();
-                console.log(
-                    "%c X Filter 4.1 Loaded ",
-                    "background:#1d9bf0;color:white;padding:5px;border-radius:4px"
-                );
-            }
-        }, 1000);
+        createPanel();
+        initialScan();
+        startObserver();
+        unlockSensitive();
+        console.log(
+            "%c X Filter 4.1 Loaded ",
+            "background:#1d9bf0;color:white;padding:5px;border-radius:4px"
+        );
     }
 
-    boot();
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", boot, { once: true });
+    } else {
+        boot();
+    }
 
 // ─── single IIFE close — nothing runs outside this scope ───────────────────
 })();
