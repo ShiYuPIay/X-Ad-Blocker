@@ -474,7 +474,7 @@
                     cleanAds(node);
                 }
             }
-        }).observe(target, { childList: true, subtree: true });
+        }).observe(target, { childList: true, subtree: false });
     }
 
     // ─────────────────────────────────────────────
