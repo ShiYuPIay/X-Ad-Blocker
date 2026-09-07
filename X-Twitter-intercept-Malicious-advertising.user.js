@@ -3,7 +3,6 @@
 // @namespace    https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main 
 // @version      1.2.0
 // @description  X/Twitter spam filter, bot detection, ad blocking and scam detection — fixed edition
-// @compatible    Chrome 80+, Firefox 74+, Safari 13.1+ (optional chaining support required)
 // @author       Via && ShiYuPIay
 // @license      MIT
 // @match        https://x.com/*
