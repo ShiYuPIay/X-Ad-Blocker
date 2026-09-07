@@ -1,45 +1,26 @@
 // ==UserScript==
 // @name         X-Twitter-intercept-Malicious-advertising.user.js
 // @namespace    https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main 
-// @version      1.1.0
+// @version      1.2.0
 // @description  X/Twitter spam filter, bot detection, ad blocking and scam detection — fixed edition
 // @compatible    Chrome 80+, Firefox 74+, Safari 13.1+ (optional chaining support required)
 // @author       Via && ShiYuPIay
 // @license      MIT
 // @match        https://x.com/*
 // @match        https://twitter.com/*
-// @run-at       document-end
+// @updateURL     https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/X-Twitter-intercept-Malicious-advertising.user.js
+// @downloadURL   https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/X-Twitter-intercept-Malicious-advertising.user.js
+// @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
+// @grant        unsafeWindow
 // ==/UserScript==
 
 /*
-  Fixes vs 4.1:
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │ 1. IIFE was split in two — everything after "Part 1 END" ran in global      │
-  │    scope and couldn't access cleanText, Keyword, CONFIG, etc.               │
-  │    → Merged into one IIFE.                                                  │
-  │                                                                             │
-  │ 2. Orphaned })(); at end-of-file caused a SyntaxError.                      │
-  │    → Removed (single IIFE close is now at the very bottom).                 │
-  │                                                                             │
-  │ 3. detectBot regex missing delimiters: (.)\1{6,}  → /(.)\1{6,}/            │
-  │                                                                             │
-  │ 4. spamScore was dead code — shouldFilter never called it.                  │
-  │    → shouldFilter now uses spamScore() with a SPAM_THRESHOLD of 40.         │
-  │                                                                             │
-  │ 5. Ad selector "article:has(span)" matched virtually every tweet.           │
-  │    → Replaced with targeted aria-label / data-testid selectors.             │
-  │                                                                             │
-  │ 6. cleanAds() was driven by setInterval(3000) while tweets used             │
-  │    MutationObserver. → Moved ad cleaning into the same observer.            │
-  │                                                                             │
-  │ 7. unlockSensitive patched window.fetch globally, corrupting any            │
-  │    response containing "possibly_sensitive".                                │
-  │    → Now scoped to api.twitter.com / api.x.com responses only.             │
-  └─────────────────────────────────────────────────────────────────────────────┘
-*/
+ * X Filter 1.2.0: performance-oriented tweet/ad filtering with configurable
+ * trusted-user rules and an opt-in, page-context sensitive-content fetch patch.
+ */
 
 (function () {
     "use strict";
@@ -65,11 +46,13 @@
                 else localStorage.setItem(key, JSON.stringify(value));
             } catch (e) {}
         },
-        copy(text) {
-            try {
-                if (typeof GM_setClipboard === "function") GM_setClipboard(text);
-                else navigator.clipboard.writeText(text);
-            } catch (e) {}
+        async copy(text) {
+            if (typeof GM_setClipboard === "function") {
+                GM_setClipboard(text);
+                return true;
+            }
+            await navigator.clipboard.writeText(text);
+            return true;
         }
     };
 
@@ -113,9 +96,16 @@
     // ─────────────────────────────────────────────
 
     let CONFIG = Object.assign(
-        { users: [], words: [], trustedUsers: [], disabledUsers: [], disabledWords: [], unlockSensitive: true },
+        { users: [], words: [], trustedUsers: [], unlockSensitive: false, debug: false },
         Storage.get("XFilterConfig", {})
     );
+    // Remove fields from old releases that were never implemented.
+    delete CONFIG.disabledUsers;
+    delete CONFIG.disabledWords;
+
+    function debugWarn(message, error) {
+        if (CONFIG.debug) console.warn("[X Filter 1.2.0] " + message, error || "");
+    }
 
     // ─────────────────────────────────────────────
     //  Cache helpers
@@ -203,7 +193,7 @@
     //  Tweet cache
     // ─────────────────────────────────────────────
 
-    const ProcessedTweets = new WeakSet();
+    let ProcessedTweets = new WeakSet();
     const TweetCache = new Map();
     const MAX_TWEET_CACHE = 8000;
 
@@ -216,37 +206,78 @@
     }
 
     // ─────────────────────────────────────────────
-    //  User blocklist check
+    //  User-rule compilation
     // ─────────────────────────────────────────────
 
-    function normalizeUserRule(value) {
+    const MAX_USER_REGEX_LENGTH = 120;
+    let BlockedUserRules = [];
+    let TrustedUserRules = [];
+
+    function normalizeUser(value) {
         return String(value || "").trim().toLowerCase().replace(/^@/, "");
     }
 
-    function userMatchesRule(user, rule) {
-        const normalizedUser = normalizeUserRule(user);
-        const normalizedRule = normalizeUserRule(rule);
-        if (!normalizedUser || !normalizedRule) return false;
-        if (normalizedRule.length > 2 && normalizedRule[0] === "/" && normalizedRule.lastIndexOf("/") > 0) {
-            const lastSlash = normalizedRule.lastIndexOf("/");
-            try {
-                return new RegExp(normalizedRule.slice(1, lastSlash), normalizedRule.slice(lastSlash + 1)).test(normalizedUser);
-            } catch (e) { return false; }
+    function compileUserRule(rule) {
+        const raw = String(rule || "").trim();
+        const lastSlash = raw.lastIndexOf("/");
+        if (raw[0] === "/" && lastSlash > 0) {
+            const pattern = raw.slice(1, lastSlash);
+            const flags = raw.slice(lastSlash + 1);
+            if (pattern.length > MAX_USER_REGEX_LENGTH || !/^[imsu]*$/.test(flags)) {
+                throw new Error("Regex is too long or has unsupported flags");
+            }
+            // Reject common nested-quantifier forms that can cause excessive backtracking.
+            if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) {
+                throw new Error("Regex contains a nested quantifier");
+            }
+            return { regex: new RegExp(pattern, flags), raw };
         }
-        return normalizedUser === normalizedRule;
+        const user = normalizeUser(raw);
+        if (!user) throw new Error("Empty username rule");
+        return { user, raw };
+    }
+
+    function compileUserRules(rules) {
+        const compiled = [];
+        const errors = [];
+        rules.forEach(rule => {
+            try { compiled.push(compileUserRule(rule)); }
+            catch (error) { errors.push(String(rule)); debugWarn("Ignored invalid user rule: " + rule, error); }
+        });
+        return { compiled, errors };
+    }
+
+    function reloadUserRules() {
+        const blocked = compileUserRules([...DEFAULT_RULES.users, ...CONFIG.users]);
+        const trusted = compileUserRules(CONFIG.trustedUsers || []);
+        BlockedUserRules = blocked.compiled;
+        TrustedUserRules = trusted.compiled;
+        return blocked.errors.concat(trusted.errors);
+    }
+
+    function userMatchesRule(user, rule) {
+        const rawCandidate = String(user || "").trim().replace(/^@/, "");
+        if (!rawCandidate) return false;
+        // Preserve user-provided regular-expression case semantics. Plain handles
+        // remain case-insensitive because X handles are case-insensitive.
+        return rule.regex ? rule.regex.test(rawCandidate) : normalizeUser(rawCandidate) === rule.user;
+    }
+
+    function matchesUserRules(userId, userName, rules) {
+        return rules.some(rule => userMatchesRule(userId, rule) || userMatchesRule(userName, rule));
     }
 
     function checkUser(userId, userName) {
-        if (!userId && !userName) return false;
-        const list = [...DEFAULT_RULES.users, ...CONFIG.users];
-        return list.some(rule => userMatchesRule(userId, rule) || userMatchesRule(userName, rule));
+        return matchesUserRules(userId, userName, BlockedUserRules);
     }
 
     function isTrustedUser(userId, userName) {
-        return (CONFIG.trustedUsers || []).some(rule =>
-            userMatchesRule(userId, rule) || userMatchesRule(userName, rule)
-        );
+        return matchesUserRules(userId, userName, TrustedUserRules);
     }
+
+    reloadUserRules();
+    // Installed at document-start so X's earliest page-context fetches are covered.
+    unlockSensitive();
 
     // ─────────────────────────────────────────────
     //  Bot detection
@@ -283,16 +314,23 @@
         const userNode = tweet.querySelector('[data-testid="User-Name"]');
         const userName = cleanText(userNode ? userNode.innerText.split("\n")[0] : "");
 
-        const avatar = tweet.querySelector('[data-testid^="UserAvatar"]');
-        const userId = avatar
-            ? avatar.getAttribute("data-testid").replace("UserAvatar-Container-", "")
-            : "";
+        const statusLink = tweet.querySelector('a[href*="/status/"]');
+        const statusMatch = statusLink && statusLink.pathname.match(/^\/([^/]+)\/status\/([^/?]+)/);
+        const userId = statusMatch ? statusMatch[1] : "";
+        const id = statusMatch ? statusMatch[2] : "";
+        // The status URL supplies the stable account handle; only fall back to
+        // visible text when X changes its link markup.
+        const profileLink = tweet.querySelector('a[href^="/"][role="link"]');
+        const profileHref = profileLink ? profileLink.getAttribute("href") || "" : "";
+        const fallbackHandle = profileHref.split("/")[1] || "";
 
-        const link = tweet.querySelector('a[href*="/status/"]');
-        const statusPart = link ? link.href.split("/status/")[1] : "";
-        const id   = statusPart ? statusPart.split("?")[0] : "";
+        return { id, text, userName, userId: userId || fallbackHandle };
+    }
 
-        return { id, text, userName, userId };
+    function hashText(text) {
+        let hash = 5381;
+        for (let i = 0; i < text.length; i += 1) hash = ((hash << 5) + hash) ^ text.charCodeAt(i);
+        return (hash >>> 0).toString(36);
     }
 
     // ─────────────────────────────────────────────
@@ -304,7 +342,11 @@
     function shouldFilter(data) {
         if (!data.text && !data.userName) return false;
 
-        const key = data.id || data.text;
+        // Text alone is not safe: author and trust rules affect the decision.
+        // Tweets without an ID receive an author-qualified, bounded cache key.
+        const key = data.id
+            ? "id:" + data.id
+            : "fallback:" + normalizeUser(data.userId || data.userName) + ":" + hashText(data.text);
         if (TweetCache.has(key)) {
             const cached = TweetCache.get(key);
             cacheTweet(key, cached);
@@ -328,20 +370,35 @@
 
     function hideTweet(tweet) {
         const container = tweet.closest('[data-testid="cellInnerDiv"]') || tweet;
-        if (container.dataset.xFiltered) return;
+        if (!container.dataset.xFiltered) container.dataset.xFilterDisplay = container.style.display;
         container.dataset.xFiltered = "true";
         container.style.display = "none";
+    }
+
+    function restoreTweet(tweet) {
+        const container = tweet.closest('[data-testid="cellInnerDiv"]') || tweet;
+        if (!container.dataset.xFiltered) return;
+        container.style.display = container.dataset.xFilterDisplay || "";
+        delete container.dataset.xFiltered;
+        delete container.dataset.xFilterDisplay;
     }
 
     // ─────────────────────────────────────────────
     //  Process single tweet
     // ─────────────────────────────────────────────
 
-    function processTweet(tweet) {
-        if (!tweet || ProcessedTweets.has(tweet)) return;
+    function processTweet(tweet, force) {
+        if (!tweet || (!force && ProcessedTweets.has(tweet))) return;
         ProcessedTweets.add(tweet);
         const data = parseTweet(tweet);
         if (shouldFilter(data)) hideTweet(tweet);
+        else restoreTweet(tweet);
+    }
+
+    function reevaluateTweets() {
+        ProcessedTweets = new WeakSet();
+        TweetCache.clear();
+        document.querySelectorAll('article[data-testid="tweet"]').forEach(tweet => processTweet(tweet, true));
     }
 
     // ─────────────────────────────────────────────
@@ -437,42 +494,42 @@
     //       third-party requests). Now scoped to api.twitter.com / api.x.com.
     // ─────────────────────────────────────────────
 
-    const ResponsePatchCache = new Map();
-    const RESPONSE_CACHE_LIMIT = 100;
-
-    function cachePatchedResponse(key, source, patched) {
-        if (ResponsePatchCache.has(key)) ResponsePatchCache.delete(key);
-        ResponsePatchCache.set(key, { source, patched });
-        if (ResponsePatchCache.size > RESPONSE_CACHE_LIMIT) {
-            ResponsePatchCache.delete(ResponsePatchCache.keys().next().value);
+    function isXApiUrl(url, base) {
+        try {
+            const hostname = new URL(url, base).hostname;
+            return hostname === "api.x.com" || hostname === "api.twitter.com";
+        } catch (error) {
+            debugWarn("Could not parse request URL", error);
+            return false;
         }
     }
 
     function unlockSensitive() {
         if (!CONFIG.unlockSensitive) return;
-        const originalFetch = window.fetch;
-        window.fetch = function (...args) {
+        const pageWindow = typeof unsafeWindow === "undefined" ? window : unsafeWindow;
+        if (!pageWindow || pageWindow.__X_FILTER_FETCH_PATCHED__) return;
+        const originalFetch = pageWindow.fetch;
+        if (typeof originalFetch !== "function") return;
+        pageWindow.__X_FILTER_FETCH_PATCHED__ = true;
+        pageWindow.fetch = function () {
+            const args = arguments;
             return originalFetch.apply(this, args).then(async response => {
-                const url = typeof args[0] === "string"
-                    ? args[0]
-                    : (args[0]?.url || "");
-                if (!url.includes("api.twitter.com") && !url.includes("api.x.com")) {
-                    return response;
-                }
+                const request = args[0];
+                const url = typeof request === "string" ? request : (request && request.url) || response.url;
+                if (!isXApiUrl(url, pageWindow.location.href)) return response;
+                const contentType = response.headers.get("content-type") || "";
+                if (!contentType.toLowerCase().includes("application/json") || !response.ok) return response;
                 try {
                     const text = await response.clone().text();
                     if (!text.includes('"possibly_sensitive":true')) return response;
-                    const cached = ResponsePatchCache.get(url);
-                    const patched = cached && cached.source === text
-                        ? cached.patched
-                        : text.replace(/"possibly_sensitive":true/g, '"possibly_sensitive":false');
-                    if (!cached || cached.source !== text) cachePatchedResponse(url, text, patched);
-                    return new Response(patched, {
-                        status:     response.status,
+                    const patched = text.replace(/"possibly_sensitive":true/g, '"possibly_sensitive":false');
+                    return new pageWindow.Response(patched, {
+                        status: response.status,
                         statusText: response.statusText,
-                        headers:    response.headers
+                        headers: response.headers
                     });
-                } catch (e) {
+                } catch (error) {
+                    debugWarn("Sensitive-content response was not patched", error);
                     return response;
                 }
             });
@@ -493,7 +550,7 @@
         style.textContent = `
             #button {
                 position: fixed; right: 20px; top: 76px;
-                width: 45px; height: 45px; border-radius: 50%;
+                width: 45px; height: 45px; border: 0; border-radius: 50%;
                 background: #1d9bf0; color: white;
                 display: flex; align-items: center; justify-content: center;
                 cursor: pointer; z-index: 999999; font-size: 20px;
@@ -503,7 +560,8 @@
             #button:hover { background: #1a8cd8; }
             #panel {
                 display: none; position: fixed;
-                right: 20px; top: 130px; width: 350px;
+                right: 20px; top: 130px; width: 350px; max-width: calc(100vw - 32px);
+                max-height: calc(100vh - 150px); overflow: auto;
                 background: white; color: #111;
                 border-radius: 16px; padding: 20px;
                 box-shadow: 0 10px 40px rgba(0,0,0,.25);
@@ -527,9 +585,9 @@
 
         const wrap = document.createElement("div");
         wrap.innerHTML = `
-            <div id="button">⚙</div>
-            <div id="panel">
-                <h3 id="title">X Filter 4.1</h3>
+            <button id="button" type="button" aria-label="打开 X Filter 设置" aria-expanded="false">⚙</button>
+            <section id="panel" role="dialog" aria-label="X Filter 设置">
+                <h3 id="title">X Filter 1.2.0</h3>
                 <p>屏蔽用户（每行一个；支持精确用户名或 <code>/正则/</code>）</p>
                 <textarea id="users"></textarea>
                 <p>信任用户（每行一个，不会被此脚本隐藏）</p>
@@ -542,7 +600,7 @@
                     <button id="export">导出规则</button>
                     <button id="reset">恢复默认</button>
                 </div>
-            </div>
+            </section>
         `;
         shadow.appendChild(wrap);
 
@@ -565,29 +623,42 @@
             panel.style.right = "auto";
         }
 
-        btn.onclick = () => {
-            panel.style.display = panel.style.display === "block" ? "none" : "block";
-        };
+        function setPanelOpen(open) {
+            panel.style.display = open ? "block" : "none";
+            btn.setAttribute("aria-expanded", String(open));
+            if (open) users.focus();
+        }
+        btn.onclick = () => setPanelOpen(panel.style.display !== "block");
+        shadow.addEventListener("keydown", event => {
+            if (event.key === "Escape") setPanelOpen(false);
+        });
 
         shadow.querySelector("#save").onclick = () => {
             CONFIG.users = users.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.trustedUsers = trustedUsers.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.words = words.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.unlockSensitive = unlockSensitiveCheckbox.checked;
+            const invalidRules = reloadUserRules();
             Storage.set("XFilterConfig", CONFIG);
             Keyword.reload();
-            TweetCache.clear();
-            alert("规则已保存。敏感内容拦截开关会在下次页面加载时生效。");
+            reevaluateTweets();
+            const suffix = invalidRules.length ? " 已忽略无效正则：" + invalidRules.join("、") : "";
+            alert("规则已保存，当前页面已重新评估。敏感内容拦截开关会在下次页面加载时生效。" + suffix);
         };
 
-        shadow.querySelector("#export").onclick = () => {
-            Storage.copy(JSON.stringify(CONFIG, null, 2));
-            alert("规则已复制到剪贴板");
+        shadow.querySelector("#export").onclick = async () => {
+            try {
+                await Storage.copy(JSON.stringify(CONFIG, null, 2));
+                alert("规则已复制到剪贴板");
+            } catch (error) {
+                debugWarn("Could not copy rules", error);
+                alert("无法复制规则，请检查剪贴板权限。");
+            }
         };
 
         shadow.querySelector("#reset").onclick = () => {
             if (confirm("恢复默认规则？自定义规则将被清除。")) {
-                CONFIG = { users: [], words: [], trustedUsers: [], disabledUsers: [], disabledWords: [], unlockSensitive: true };
+                CONFIG = { users: [], words: [], trustedUsers: [], unlockSensitive: false, debug: false };
                 Storage.set("XFilterConfig", CONFIG);
                 location.reload();
             }
@@ -626,9 +697,8 @@
         createPanel();
         initialScan();
         startObserver();
-        unlockSensitive();
         console.log(
-            "%c X Filter 4.1 Loaded ",
+            "%c X Filter 1.2.0 Loaded ",
             "background:#1d9bf0;color:white;padding:5px;border-radius:4px"
         );
     }
