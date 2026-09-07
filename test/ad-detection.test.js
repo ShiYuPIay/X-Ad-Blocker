@@ -5,6 +5,22 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
+const USER_SCRIPT_PATH = path.join(
+    __dirname,
+    '..',
+    'X-Twitter-intercept-Malicious-advertising.user.js'
+);
+
+function userScriptSource() {
+    return fs.readFileSync(USER_SCRIPT_PATH, 'utf8');
+}
+
+function userScriptMetadata(source) {
+    return Object.fromEntries(
+        [...source.matchAll(/^\/\/\s+@(\S+)\s+(.+)$/gm)].map(([, key, value]) => [key, value.trim()])
+    );
+}
+
 class FixtureNode {
     constructor({ testid, ariaLabel = '', text = '', children = [], throwSelectors = [] } = {}) {
         this.testid = testid;
@@ -43,10 +59,7 @@ class FixtureNode {
 }
 
 function adDetectionFixture(debug = false) {
-    const source = fs.readFileSync(
-        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
-        'utf8'
-    );
+    const source = userScriptSource();
     const start = source.indexOf('    const AD_SELECTORS =');
     const end = source.indexOf('    // ─────────────────────────────────────────────\n    //  MutationObserver', start);
     assert.notEqual(start, -1, 'ad detection section should exist');
@@ -68,6 +81,22 @@ function adDetectionFixture(debug = false) {
         logs
     };
 }
+
+test('keeps a stable identity and a newer version for Tampermonkey updates', () => {
+    const metadata = userScriptMetadata(userScriptSource());
+
+    // Tampermonkey uses @name and @namespace to associate an update with an
+    // installed script. Keep the identity used by 1.2.0 so that release can
+    // update automatically instead of being offered as a separate script.
+    assert.equal(metadata.name, 'X-Twitter-intercept-Malicious-advertising.user.js');
+    assert.equal(
+        metadata.namespace,
+        'https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main'
+    );
+    assert.equal(metadata.version, '1.3.1');
+    assert.match(metadata.updateURL, /^https:\/\/raw\.githubusercontent\.com\//);
+    assert.equal(metadata.updateURL, metadata.downloadURL);
+});
 
 function cell(child) {
     return new FixtureNode({ testid: 'cellInnerDiv', children: [child] });
@@ -148,10 +177,7 @@ test('continues social-context detection after an ad selector fails and only log
 });
 
 test('storage write failures return false and include the operation, key, and error in debug logs', () => {
-    const source = fs.readFileSync(
-        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
-        'utf8'
-    );
+    const source = userScriptSource();
     const storageStart = source.indexOf('    const Storage =');
     const storageEnd = source.indexOf('    // ─────────────────────────────────────────────\n    //  Default filter rules', storageStart);
     const warnings = [];
@@ -237,20 +263,14 @@ test('sensitive-content fetch hook only patches successful JSON responses from X
 });
 
 test('settings describe sensitive-content modification as best effort', () => {
-    const source = fs.readFileSync(
-        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
-        'utf8'
-    );
+    const source = userScriptSource();
 
     assert.match(source, /尝试修改部分 X API fetch 响应；X 的请求实现变化时可能无效/);
     assert.doesNotMatch(source, /XMLHttpRequest/);
 });
 
 test('userscript branding selects concise Chinese or English copy from browser language', () => {
-    const source = fs.readFileSync(
-        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
-        'utf8'
-    );
+    const source = userScriptSource();
 
     const start = source.indexOf('    const UI_COPY =');
     const end = source.indexOf('    const Storage =', start);
@@ -263,6 +283,6 @@ test('userscript branding selects concise Chinese or English copy from browser l
     assert.equal(getUiText(['en-US']).name, 'X Ad Blocker');
     assert.match(getUiText(['en-GB']).openSettings, /Open X Ad Blocker settings/);
     assert.match(source, /@name:zh-CN\s+X 广告拦截/);
-    assert.match(source, /@name\s+X Ad Blocker/);
+    assert.equal(userScriptMetadata(source).name, 'X-Twitter-intercept-Malicious-advertising.user.js');
     assert.match(source, /<svg class="brand-icon"/);
 });
