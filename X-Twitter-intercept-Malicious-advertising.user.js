@@ -12,6 +12,7 @@
 // @downloadURL   https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/X-Twitter-intercept-Malicious-advertising.user.js
 // @require       https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/lib/filter-core.js
 // @run-at       document-start
+// @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
@@ -25,6 +26,9 @@
 
 (function () {
     "use strict";
+
+    // Defend against userscript managers that do not honor @noframes.
+    if (window.top !== window.self) return;
 
     if (window.__X_FILTER_ENHANCED_LOADED__) return;
     window.__X_FILTER_ENHANCED_LOADED__ = true;
