@@ -369,6 +369,7 @@
                 }
             });
         };
+        debugWarn("Sensitive-content fetch hook installed");
     }
 
     // ─────────────────────────────────────────────
@@ -432,7 +433,7 @@
                 <textarea id="words"></textarea>
                 <p>自定义内容正则（每行一个；格式 <code>/正则/flags</code>，命中后立即隐藏）</p>
                 <textarea id="regex"></textarea>
-                <p><label><input id="unlock-sensitive" type="checkbox"> 解锁敏感内容（拦截 X API fetch）</label></p>
+                <p><label><input id="unlock-sensitive" type="checkbox"> 尝试修改部分 X API fetch 响应；X 的请求实现变化时可能无效</label></p>
                 <div>
                     <button id="save">保存规则</button>
                     <button id="export">导出规则</button>

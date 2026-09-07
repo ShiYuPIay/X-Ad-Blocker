@@ -177,3 +177,71 @@ test('storage write failures return false and include the operation, key, and er
     assert.match(warnings[0][0], /Storage\.set failed for key: XFilterConfig/);
     assert.equal(warnings[0][1], writeError);
 });
+
+function sensitiveContentFixture(debug = false) {
+    const source = fs.readFileSync(
+        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
+        'utf8'
+    );
+    const start = source.indexOf('    function isXApiUrl(url, base) {');
+    const end = source.indexOf('    // ─────────────────────────────────────────────\n    //  Settings panel UI', start);
+    assert.notEqual(start, -1, 'sensitive-content section should exist');
+    assert.notEqual(end, -1, 'sensitive-content section should have a clear boundary');
+
+    const logs = [];
+    const pageWindow = {
+        location: { href: 'https://x.com/home' },
+        Response,
+        fetch: async () => { throw new Error('Test fetch implementation was not provided'); }
+    };
+    const createUnlocker = new Function('CONFIG', 'unsafeWindow', 'window', 'XFilterCore', 'debugWarn', `
+        ${source.slice(start, end)}
+        return unlockSensitive;
+    `);
+    return {
+        logs,
+        pageWindow,
+        unlock: createUnlocker(
+            { unlockSensitive: true, debug },
+            pageWindow,
+            pageWindow,
+            require('../lib/filter-core'),
+            (...args) => { if (debug) logs.push(args); }
+        )
+    };
+}
+
+test('sensitive-content fetch hook only patches successful JSON responses from X APIs and logs installation in debug mode', async () => {
+    const { logs, pageWindow, unlock } = sensitiveContentFixture(true);
+    const responseFor = (body, { url = 'https://api.x.com/2/timeline', contentType = 'application/json', status = 200 } = {}) =>
+        new Response(body, { status, headers: { 'content-type': contentType } });
+
+    pageWindow.fetch = async request => responseFor('{"possibly_sensitive":true}', request);
+    unlock();
+
+    assert.equal(pageWindow.__X_FILTER_FETCH_PATCHED__, true);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0][0], /Sensitive-content fetch hook installed/);
+
+    const patched = await pageWindow.fetch({ url: 'https://api.x.com/2/timeline' });
+    assert.equal(await patched.text(), '{"possibly_sensitive":false}');
+
+    const external = await pageWindow.fetch({ url: 'https://example.com/data' });
+    assert.equal(await external.text(), '{"possibly_sensitive":true}');
+
+    const nonJson = await pageWindow.fetch({ url: 'https://api.x.com/2/timeline', contentType: 'text/plain' });
+    assert.equal(await nonJson.text(), '{"possibly_sensitive":true}');
+
+    const failed = await pageWindow.fetch({ url: 'https://api.x.com/2/timeline', status: 403 });
+    assert.equal(await failed.text(), '{"possibly_sensitive":true}');
+});
+
+test('settings describe sensitive-content modification as best effort', () => {
+    const source = fs.readFileSync(
+        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
+        'utf8'
+    );
+
+    assert.match(source, /尝试修改部分 X API fetch 响应；X 的请求实现变化时可能无效/);
+    assert.doesNotMatch(source, /XMLHttpRequest/);
+});
