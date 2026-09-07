@@ -10,6 +10,7 @@
 // @match        https://twitter.com/*
 // @updateURL     https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/X-Twitter-intercept-Malicious-advertising.user.js
 // @downloadURL   https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/X-Twitter-intercept-Malicious-advertising.user.js
+// @require       https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/lib/filter-core.js
 // @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -121,330 +122,44 @@
     }
 
     // ─────────────────────────────────────────────
-    //  Cache helpers
+    //  DOM-independent filter engine
     // ─────────────────────────────────────────────
 
-    const TextCache = new Map();
-    const CACHE_LIMIT = 5000;
+    const FilterEngine = XFilterCore.createFilterEngine(CONFIG, DEFAULT_RULES, (rule, error) => {
+        debugWarn("Ignored invalid filter rule: " + rule, error);
+    });
 
-    function cacheSet(map, key, value) {
-        // Map insertion order makes this a compact LRU cache: refreshing a key
-        // moves it to the end and eviction always removes the least-recent entry.
-        if (map.has(key)) map.delete(key);
-        map.set(key, value);
-        if (map.size > CACHE_LIMIT) map.delete(map.keys().next().value);
-    }
-
-    function cleanText(text) {
-        if (!text) return "";
-        if (TextCache.has(text)) {
-            const cached = TextCache.get(text);
-            cacheSet(TextCache, text, cached);
-            return cached;
-        }
-        const result = text.replace(/[\u200B-\u200F\uFEFF\u2060]/g, "").trim();
-        cacheSet(TextCache, text, result);
-        return result;
-    }
-
-    // ─────────────────────────────────────────────
-    //  Keyword engine
-    // ─────────────────────────────────────────────
-
-    class KeywordEngine {
-        constructor() {
-            this.defaultWords = new Set();
-            this.userWords = new Set();
-            this.reload();
-        }
-        reload() {
-            this.defaultWords = new Set(DEFAULT_RULES.words.map(word => word.toLowerCase()));
-            this.userWords = new Set((CONFIG.words || []).map(word => word.toLowerCase()));
-        }
-        matchWords(text, words, source) {
-            const lower = text.toLowerCase();
-            for (const word of words) {
-                if (lower.includes(word)) return createMatchReason(source, { word });
-            }
-            return null;
-        }
-        matchDefault(text) {
-            return this.matchWords(text, this.defaultWords, "default-keyword");
-        }
-        matchUser(text) {
-            return this.matchWords(text, this.userWords, "user-keyword");
-        }
-    }
-
-    const Keyword = new KeywordEngine();
-
-    // ─────────────────────────────────────────────
-    //  Regex engine
-    // ─────────────────────────────────────────────
-
-    const DefaultRegexRules = [...DEFAULT_RULES.regex];
-    let UserRegexRules = [];
-
-    const MATCH_REASON_LABELS = {
-        "user-keyword": "用户关键词命中",
-        "user-regex": "用户正则命中",
-        "default-keyword": "默认关键词命中",
-        "default-regex": "默认正则命中",
-        "blocked-user": "屏蔽用户命中",
-        "risk-score": "风险评分命中",
-        "bot-detection": "机器人检测命中"
-    };
-
-    function createMatchReason(source, details) {
-        return Object.assign({ source, label: MATCH_REASON_LABELS[source] || source }, details);
-    }
-
-    function matchRegex(text, rules, source) {
-        for (const rule of rules) {
-            const regex = rule.regex || rule;
-            // A global/sticky expression retains lastIndex between tests.
-            regex.lastIndex = 0;
-            if (regex.test(text)) return createMatchReason(source, { regex: rule.raw || regex.toString() });
-        }
-        return null;
-    }
-
-    // ─────────────────────────────────────────────
-    //  Risk scoring — FIX: was defined but never called; now used by shouldFilter
-    // ─────────────────────────────────────────────
-
-    const SPAM_THRESHOLD = 60;
-
-    function spamScore(data, defaultKeywordMatch, defaultRegexMatch) {
-        let score = 0;
-        const text = data.text.toLowerCase();
-        if (defaultKeywordMatch)           score += 40;
-        if (defaultRegexMatch)             score += 40;
-        if (text.length < 8)              score += 10;
-        if (/(.)\1{5,}/.test(text))       score += 20;
-        if (/[🔥💎⭐🚀]{5,}/.test(text)) score += 20;
-        return score;
-    }
-
-    // ─────────────────────────────────────────────
-    //  Tweet cache
-    // ─────────────────────────────────────────────
-
-    let ProcessedTweets = new WeakSet();
-    const TweetCache = new Map();
-    const MAX_TWEET_CACHE = 8000;
-
-    function cacheTweet(id, value) {
-        if (TweetCache.has(id)) TweetCache.delete(id);
-        TweetCache.set(id, value);
-        if (TweetCache.size > MAX_TWEET_CACHE) {
-            TweetCache.delete(TweetCache.keys().next().value);
-        }
-    }
-
-    // ─────────────────────────────────────────────
-    //  User-rule compilation
-    // ─────────────────────────────────────────────
-
-    const MAX_USER_REGEX_LENGTH = 120;
-    let BlockedUserRules = [];
-    let TrustedUserRules = [];
-
-    function normalizeUser(value) {
-        return String(value || "").trim().toLowerCase().replace(/^@/, "");
-    }
-
-    function compileUserRule(rule) {
-        const raw = String(rule || "").trim();
-        const lastSlash = raw.lastIndexOf("/");
-        if (raw[0] === "/" && lastSlash > 0) {
-            const pattern = raw.slice(1, lastSlash);
-            const flags = raw.slice(lastSlash + 1);
-            if (pattern.length > MAX_USER_REGEX_LENGTH || !/^[imsu]*$/.test(flags)) {
-                throw new Error("Regex is too long or has unsupported flags");
-            }
-            // Reject common nested-quantifier forms that can cause excessive backtracking.
-            if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) {
-                throw new Error("Regex contains a nested quantifier");
-            }
-            return { regex: new RegExp(pattern, flags), raw };
-        }
-        const user = normalizeUser(raw);
-        if (!user) throw new Error("Empty username rule");
-        return { user, raw };
-    }
-
-    function compileUserRules(rules) {
-        const compiled = [];
-        const errors = [];
-        rules.forEach(rule => {
-            try { compiled.push(compileUserRule(rule)); }
-            catch (error) { errors.push(String(rule)); debugWarn("Ignored invalid user rule: " + rule, error); }
-        });
-        return { compiled, errors };
-    }
-
-    function compileContentRegexRules(rules) {
-        const compiled = [];
-        const errors = [];
-        rules.forEach(rule => {
-            const raw = String(rule || "").trim();
-            const lastSlash = raw.lastIndexOf("/");
-            try {
-                if (raw[0] !== "/" || lastSlash <= 0) throw new Error("Regex must use /pattern/flags syntax");
-                const pattern = raw.slice(1, lastSlash);
-                const flags = raw.slice(lastSlash + 1);
-                if (pattern.length > MAX_USER_REGEX_LENGTH || !/^[imsu]*$/.test(flags)) {
-                    throw new Error("Regex is too long or has unsupported flags");
-                }
-                if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) throw new Error("Regex contains a nested quantifier");
-                compiled.push({ regex: new RegExp(pattern, flags), raw });
-            } catch (error) {
-                errors.push(raw);
-                debugWarn("Ignored invalid content regex: " + raw, error);
-            }
-        });
-        return { compiled, errors };
-    }
-
-    function reloadUserRules() {
-        const blocked = compileUserRules([...DEFAULT_RULES.users, ...CONFIG.users]);
-        const trusted = compileUserRules(CONFIG.trustedUsers || []);
-        const contentRegex = compileContentRegexRules(CONFIG.regex || []);
-        BlockedUserRules = blocked.compiled;
-        TrustedUserRules = trusted.compiled;
-        UserRegexRules = contentRegex.compiled;
-        return blocked.errors.concat(trusted.errors, contentRegex.errors);
-    }
-
-    function userMatchesRule(user, rule) {
-        const rawCandidate = String(user || "").trim().replace(/^@/, "");
-        if (!rawCandidate) return false;
-        // Preserve user-provided regular-expression case semantics. Plain handles
-        // remain case-insensitive because X handles are case-insensitive.
-        return rule.regex ? rule.regex.test(rawCandidate) : normalizeUser(rawCandidate) === rule.user;
-    }
-
-    function matchesUserRules(userId, userName, rules) {
-        return rules.some(rule => userMatchesRule(userId, rule) || userMatchesRule(userName, rule));
-    }
-
-    function checkUser(userId, userName) {
-        return matchesUserRules(userId, userName, BlockedUserRules);
-    }
-
-    function isTrustedUser(userId, userName) {
-        return matchesUserRules(userId, userName, TrustedUserRules);
-    }
-
-    reloadUserRules();
     // Installed at document-start so X's earliest page-context fetches are covered.
     unlockSensitive();
 
-    // ─────────────────────────────────────────────
-    //  Bot detection
-    //  FIX: regex was written as bare  (.)\1{6,}  without /…/ delimiters
-    //       → SyntaxError at parse time; corrected to  /(.)\1{6,}/
-    // ─────────────────────────────────────────────
-
-    function detectBot(text, userName) {
-        if (!text) return false;
-        let score = 0;
-
-        if (/(.)\1{6,}/.test(text)) score += 25;
-
-        const emojiCount = (text.match(/[\u{1F300}-\u{1FAFF}]/gu) || []).length;
-        if (emojiCount >= 8) score += 20;
-
-        if (/👇|⬇|👉|点击|领取|加入/.test(text)) score += 20;
-
-        if (text.length < 6) score += 10;
-
-        if (userName && /福利|资源|兼职|客服|官方|bot|机器人/i.test(userName)) score += 30;
-
-        return score >= 50;
+    function reloadUserRules() {
+        return FilterEngine.reload();
     }
-
-    // ─────────────────────────────────────────────
-    //  Tweet parsing
-    // ─────────────────────────────────────────────
-
-    function parseTweet(tweet) {
-        const textNode = tweet.querySelector('[data-testid="tweetText"]');
-        const text     = cleanText(textNode ? textNode.innerText : "");
-
-        const userNode = tweet.querySelector('[data-testid="User-Name"]');
-        const userName = cleanText(userNode ? userNode.innerText.split("\n")[0] : "");
-
-        const statusLink = tweet.querySelector('a[href*="/status/"]');
-        const statusMatch = statusLink && statusLink.pathname.match(/^\/([^/]+)\/status\/([^/?]+)/);
-        const userId = statusMatch ? statusMatch[1] : "";
-        const id = statusMatch ? statusMatch[2] : "";
-        // The status URL supplies the stable account handle; only fall back to
-        // visible text when X changes its link markup.
-        const profileLink = tweet.querySelector('a[href^="/"][role="link"]');
-        const profileHref = profileLink ? profileLink.getAttribute("href") || "" : "";
-        const fallbackHandle = profileHref.split("/")[1] || "";
-
-        return { id, text, userName, userId: userId || fallbackHandle };
-    }
-
-    function hashText(text) {
-        let hash = 5381;
-        for (let i = 0; i < text.length; i += 1) hash = ((hash << 5) + hash) ^ text.charCodeAt(i);
-        return (hash >>> 0).toString(36);
-    }
-
-    // ─────────────────────────────────────────────
-    //  Filter decision
-    //  FIX: now routes through spamScore() instead of calling Keyword /
-    //       matchRegex / detectBot individually (spamScore was dead code before)
-    // ─────────────────────────────────────────────
 
     function shouldFilter(data) {
-        if (!data.text && !data.userName) return { shouldHide: false, reason: null };
+        return FilterEngine.shouldFilter(data);
+    }
 
-        // Text alone is not safe: author and trust rules affect the decision.
-        // Tweets without an ID receive an author-qualified, bounded cache key.
-        const key = data.id
-            ? "id:" + data.id
-            : "fallback:" + normalizeUser(data.userId || data.userName) + ":" + hashText(data.text);
-        if (TweetCache.has(key)) {
-            const cached = TweetCache.get(key);
-            cacheTweet(key, cached);
-            return cached;
-        }
-
-        const trusted = isTrustedUser(data.userId, data.userName);
-        let result = { shouldHide: false, reason: null };
-        if (!trusted) {
-            const userKeywordMatch = Keyword.matchUser(data.text);
-            const userRegexMatch = matchRegex(data.text, UserRegexRules, "user-regex");
-            // User content rules are explicit blocks, not risk signals, so they
-            // must never depend on the aggregate spam-score threshold.
-            if (userKeywordMatch) {
-                result = { shouldHide: true, reason: userKeywordMatch };
-            } else if (userRegexMatch) {
-                result = { shouldHide: true, reason: userRegexMatch };
-            } else if (checkUser(data.userId, data.userName)) {
-                result = { shouldHide: true, reason: createMatchReason("blocked-user") };
-            } else {
-                const defaultKeywordMatch = Keyword.matchDefault(data.text);
-                const defaultRegexMatch = matchRegex(data.text, DefaultRegexRules, "default-regex");
-                const score = spamScore(data, defaultKeywordMatch, defaultRegexMatch);
-                if (score >= SPAM_THRESHOLD) {
-                    result = {
-                        shouldHide: true,
-                        reason: createMatchReason("risk-score", { score, defaultKeywordMatch, defaultRegexMatch })
-                    };
-                } else if (detectBot(data.text, data.userName)) {
-                    result = { shouldHide: true, reason: createMatchReason("bot-detection") };
-                }
-            }
-        }
-
-        cacheTweet(key, result);
+    const TextCache = new Map();
+    function cleanText(text) {
+        if (!text) return "";
+        if (TextCache.has(text)) return TextCache.get(text);
+        const result = text.replace(/[\u200B-\u200F\uFEFF\u2060]/g, "").trim();
+        TextCache.set(text, result);
         return result;
+    }
+
+    let ProcessedTweets = new WeakSet();
+    function parseTweet(tweet) {
+        const textNode = tweet.querySelector('[data-testid="tweetText"]');
+        const text = cleanText(textNode ? textNode.innerText : "");
+        const userNode = tweet.querySelector('[data-testid="User-Name"]');
+        const userName = cleanText(userNode ? userNode.innerText.split("\n")[0] : "");
+        const statusLink = tweet.querySelector('a[href*="/status/"]');
+        const statusMatch = statusLink && statusLink.pathname.match(/^\/([^/]+)\/status\/([^/?]+)/);
+        const profileLink = tweet.querySelector('a[href^="/"][role="link"]');
+        const profileHref = profileLink ? profileLink.getAttribute("href") || "" : "";
+        return { id: statusMatch ? statusMatch[2] : "", text, userName, userId: (statusMatch && statusMatch[1]) || profileHref.split("/")[1] || "" };
     }
 
     // ─────────────────────────────────────────────
@@ -480,7 +195,7 @@
 
     function reevaluateTweets() {
         ProcessedTweets = new WeakSet();
-        TweetCache.clear();
+        FilterEngine.clearCache();
         document.querySelectorAll('article[data-testid="tweet"]').forEach(tweet => processTweet(tweet, true));
     }
 
@@ -617,13 +332,7 @@
     // ─────────────────────────────────────────────
 
     function isXApiUrl(url, base) {
-        try {
-            const hostname = new URL(url, base).hostname;
-            return hostname === "api.x.com" || hostname === "api.twitter.com";
-        } catch (error) {
-            debugWarn("Could not parse request URL", error);
-            return false;
-        }
+        return XFilterCore.isXApiUrl(url, base);
     }
 
     function unlockSensitive() {
@@ -779,7 +488,6 @@
                 return;
             }
             showSaveStatus("");
-            Keyword.reload();
             reevaluateTweets();
             const suffix = invalidRules.length ? " 已忽略无效正则：" + invalidRules.join("、") : "";
             alert("规则已保存，当前页面已重新评估。敏感内容拦截开关会在下次页面加载时生效。" + suffix);
