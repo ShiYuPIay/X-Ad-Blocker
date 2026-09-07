@@ -96,12 +96,14 @@
     // ─────────────────────────────────────────────
 
     let CONFIG = Object.assign(
-        { users: [], words: [], trustedUsers: [], unlockSensitive: false, debug: false },
+        { users: [], words: [], regex: [], trustedUsers: [], unlockSensitive: false, debug: false },
         Storage.get("XFilterConfig", {})
     );
     // Remove fields from old releases that were never implemented.
     delete CONFIG.disabledUsers;
     delete CONFIG.disabledWords;
+    // Older saved configurations do not have custom regular expressions.
+    if (!Array.isArray(CONFIG.regex)) CONFIG.regex = [];
 
     function debugWarn(message, error) {
         if (CONFIG.debug) console.warn("[X Filter 1.2.0] " + message, error || "");
@@ -140,20 +142,26 @@
 
     class KeywordEngine {
         constructor() {
-            this.set = new Set();
+            this.defaultWords = new Set();
+            this.userWords = new Set();
             this.reload();
         }
         reload() {
-            this.set.clear();
-            [...DEFAULT_RULES.words, ...CONFIG.words]
-                .forEach(w => this.set.add(w.toLowerCase()));
+            this.defaultWords = new Set(DEFAULT_RULES.words.map(word => word.toLowerCase()));
+            this.userWords = new Set((CONFIG.words || []).map(word => word.toLowerCase()));
         }
-        match(text) {
+        matchWords(text, words, source) {
             const lower = text.toLowerCase();
-            for (const word of this.set) {
-                if (lower.includes(word)) return true;
+            for (const word of words) {
+                if (lower.includes(word)) return createMatchReason(source, { word });
             }
-            return false;
+            return null;
+        }
+        matchDefault(text) {
+            return this.matchWords(text, this.defaultWords, "default-keyword");
+        }
+        matchUser(text) {
+            return this.matchWords(text, this.userWords, "user-keyword");
         }
     }
 
@@ -163,13 +171,31 @@
     //  Regex engine
     // ─────────────────────────────────────────────
 
-    const RegexRules = [...DEFAULT_RULES.regex];
+    const DefaultRegexRules = [...DEFAULT_RULES.regex];
+    let UserRegexRules = [];
 
-    function matchRegex(text) {
-        for (const reg of RegexRules) {
-            if (reg.test(text)) return true;
+    const MATCH_REASON_LABELS = {
+        "user-keyword": "用户关键词命中",
+        "user-regex": "用户正则命中",
+        "default-keyword": "默认关键词命中",
+        "default-regex": "默认正则命中",
+        "blocked-user": "屏蔽用户命中",
+        "risk-score": "风险评分命中",
+        "bot-detection": "机器人检测命中"
+    };
+
+    function createMatchReason(source, details) {
+        return Object.assign({ source, label: MATCH_REASON_LABELS[source] || source }, details);
+    }
+
+    function matchRegex(text, rules, source) {
+        for (const rule of rules) {
+            const regex = rule.regex || rule;
+            // A global/sticky expression retains lastIndex between tests.
+            regex.lastIndex = 0;
+            if (regex.test(text)) return createMatchReason(source, { regex: rule.raw || regex.toString() });
         }
-        return false;
+        return null;
     }
 
     // ─────────────────────────────────────────────
@@ -178,11 +204,11 @@
 
     const SPAM_THRESHOLD = 60;
 
-    function spamScore(data) {
+    function spamScore(data, defaultKeywordMatch, defaultRegexMatch) {
         let score = 0;
         const text = data.text.toLowerCase();
-        if (Keyword.match(text))           score += 40;
-        if (matchRegex(text))              score += 40;
+        if (defaultKeywordMatch)           score += 40;
+        if (defaultRegexMatch)             score += 40;
         if (text.length < 8)              score += 10;
         if (/(.)\1{5,}/.test(text))       score += 20;
         if (/[🔥💎⭐🚀]{5,}/.test(text)) score += 20;
@@ -247,12 +273,37 @@
         return { compiled, errors };
     }
 
+    function compileContentRegexRules(rules) {
+        const compiled = [];
+        const errors = [];
+        rules.forEach(rule => {
+            const raw = String(rule || "").trim();
+            const lastSlash = raw.lastIndexOf("/");
+            try {
+                if (raw[0] !== "/" || lastSlash <= 0) throw new Error("Regex must use /pattern/flags syntax");
+                const pattern = raw.slice(1, lastSlash);
+                const flags = raw.slice(lastSlash + 1);
+                if (pattern.length > MAX_USER_REGEX_LENGTH || !/^[imsu]*$/.test(flags)) {
+                    throw new Error("Regex is too long or has unsupported flags");
+                }
+                if (/\([^)]*[+*][^)]*\)[+*{]/.test(pattern)) throw new Error("Regex contains a nested quantifier");
+                compiled.push({ regex: new RegExp(pattern, flags), raw });
+            } catch (error) {
+                errors.push(raw);
+                debugWarn("Ignored invalid content regex: " + raw, error);
+            }
+        });
+        return { compiled, errors };
+    }
+
     function reloadUserRules() {
         const blocked = compileUserRules([...DEFAULT_RULES.users, ...CONFIG.users]);
         const trusted = compileUserRules(CONFIG.trustedUsers || []);
+        const contentRegex = compileContentRegexRules(CONFIG.regex || []);
         BlockedUserRules = blocked.compiled;
         TrustedUserRules = trusted.compiled;
-        return blocked.errors.concat(trusted.errors);
+        UserRegexRules = contentRegex.compiled;
+        return blocked.errors.concat(trusted.errors, contentRegex.errors);
     }
 
     function userMatchesRule(user, rule) {
@@ -340,7 +391,7 @@
     // ─────────────────────────────────────────────
 
     function shouldFilter(data) {
-        if (!data.text && !data.userName) return false;
+        if (!data.text && !data.userName) return { shouldHide: false, reason: null };
 
         // Text alone is not safe: author and trust rules affect the decision.
         // Tweets without an ID receive an author-qualified, bounded cache key.
@@ -354,11 +405,32 @@
         }
 
         const trusted = isTrustedUser(data.userId, data.userName);
-        const result = !trusted && (
-            checkUser(data.userId, data.userName) ||
-            spamScore(data) >= SPAM_THRESHOLD ||
-            detectBot(data.text, data.userName)
-        );
+        let result = { shouldHide: false, reason: null };
+        if (!trusted) {
+            const userKeywordMatch = Keyword.matchUser(data.text);
+            const userRegexMatch = matchRegex(data.text, UserRegexRules, "user-regex");
+            // User content rules are explicit blocks, not risk signals, so they
+            // must never depend on the aggregate spam-score threshold.
+            if (userKeywordMatch) {
+                result = { shouldHide: true, reason: userKeywordMatch };
+            } else if (userRegexMatch) {
+                result = { shouldHide: true, reason: userRegexMatch };
+            } else if (checkUser(data.userId, data.userName)) {
+                result = { shouldHide: true, reason: createMatchReason("blocked-user") };
+            } else {
+                const defaultKeywordMatch = Keyword.matchDefault(data.text);
+                const defaultRegexMatch = matchRegex(data.text, DefaultRegexRules, "default-regex");
+                const score = spamScore(data, defaultKeywordMatch, defaultRegexMatch);
+                if (score >= SPAM_THRESHOLD) {
+                    result = {
+                        shouldHide: true,
+                        reason: createMatchReason("risk-score", { score, defaultKeywordMatch, defaultRegexMatch })
+                    };
+                } else if (detectBot(data.text, data.userName)) {
+                    result = { shouldHide: true, reason: createMatchReason("bot-detection") };
+                }
+            }
+        }
 
         cacheTweet(key, result);
         return result;
@@ -391,7 +463,7 @@
         if (!tweet || (!force && ProcessedTweets.has(tweet))) return;
         ProcessedTweets.add(tweet);
         const data = parseTweet(tweet);
-        if (shouldFilter(data)) hideTweet(tweet);
+        if (shouldFilter(data).shouldHide) hideTweet(tweet);
         else restoreTweet(tweet);
     }
 
@@ -592,8 +664,10 @@
                 <textarea id="users"></textarea>
                 <p>信任用户（每行一个，不会被此脚本隐藏）</p>
                 <textarea id="trusted-users"></textarea>
-                <p>屏蔽关键词（每行一个）</p>
+                <p>自定义关键词（每行一个；命中后立即隐藏）</p>
                 <textarea id="words"></textarea>
+                <p>自定义内容正则（每行一个；格式 <code>/正则/flags</code>，命中后立即隐藏）</p>
+                <textarea id="regex"></textarea>
                 <p><label><input id="unlock-sensitive" type="checkbox"> 解锁敏感内容（拦截 X API fetch）</label></p>
                 <div>
                     <button id="save">保存规则</button>
@@ -609,11 +683,13 @@
         const users = shadow.querySelector("#users");
         const trustedUsers = shadow.querySelector("#trusted-users");
         const words = shadow.querySelector("#words");
+        const regex = shadow.querySelector("#regex");
         const unlockSensitiveCheckbox = shadow.querySelector("#unlock-sensitive");
 
         users.value = CONFIG.users.join("\n");
         trustedUsers.value = (CONFIG.trustedUsers || []).join("\n");
         words.value = CONFIG.words.join("\n");
+        regex.value = CONFIG.regex.join("\n");
         unlockSensitiveCheckbox.checked = CONFIG.unlockSensitive !== false;
 
         const savedPosition = Storage.get("XFilterPanelPosition", null);
@@ -637,6 +713,7 @@
             CONFIG.users = users.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.trustedUsers = trustedUsers.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.words = words.value.split("\n").map(x => x.trim()).filter(Boolean);
+            CONFIG.regex = regex.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.unlockSensitive = unlockSensitiveCheckbox.checked;
             const invalidRules = reloadUserRules();
             Storage.set("XFilterConfig", CONFIG);
@@ -658,7 +735,7 @@
 
         shadow.querySelector("#reset").onclick = () => {
             if (confirm("恢复默认规则？自定义规则将被清除。")) {
-                CONFIG = { users: [], words: [], trustedUsers: [], unlockSensitive: false, debug: false };
+                CONFIG = { users: [], words: [], regex: [], trustedUsers: [], unlockSensitive: false, debug: false };
                 Storage.set("XFilterConfig", CONFIG);
                 location.reload();
             }
