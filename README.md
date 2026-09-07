@@ -20,6 +20,21 @@
 
 The test environment used for this documentation change does not include Chrome, Chromium, Firefox, or Tampermonkey. Version numbers and passing results must not be inferred from the script's JavaScript support or its unit tests.
 
+### Tampermonkey 安装验收
+
+每次发布前，使用目标浏览器中的 Tampermonkey 完成以下安装和回归验收，并将结果记录到下方的发布前检查表。
+
+1. 在 Tampermonkey Dashboard 中打开“实用工具”（Utilities），粘贴脚本 Raw 地址并安装；也可以直接在浏览器中打开 [Raw `.user.js` 地址](https://raw.githubusercontent.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/main/X-Twitter-intercept-Malicious-advertising.user.js)，在 Tampermonkey 安装预览页完成安装。
+2. 在安装预览页确认恰好展示以下四项 grant：`GM_getValue`、`GM_setValue`、`GM_setClipboard`、`unsafeWindow`。若 grant 缺失、额外出现，或预览页未将其识别为用户脚本，则停止发布并排查元数据。
+3. 分别直接访问脚本的 `@updateURL` 与 `@downloadURL`，确认两者均返回 Userscript 文件内容，而不是 HTML 页面、登录页或错误重定向。
+4. 打开 `https://x.com/` 验证：设置面板只出现一次；新增或修改规则后可以保存；让剪贴板导出失败时会显示错误；刷新页面后，配置和设置面板位置均能恢复。
+5. 记录本次 Tampermonkey 版本、测试日期和每项结果，作为发布前检查项；任一失败或未执行项都不得标记为通过。
+
+| 发布前检查项 | Tampermonkey 版本 | 测试日期 | 结果 | 证据 / 备注 |
+| --- | --- | --- | --- | --- |
+| 安装预览、grant 与 URL 响应 |  |  | Pending |  |
+| X 页面设置、规则保存、导出失败与状态恢复 |  |  | Pending |  |
+
 ### Required manual scenarios
 
 Run every scenario below in **each** row above. Record the exact browser and Tampermonkey versions, the calendar date, evidence (for example, screenshot or issue link), and any observed limitation in the validation record. Mark a combination as **Verified** only when every applicable scenario passes; then add that exact combination to this table and, if desired, to the userscript `@compatible` metadata.
