@@ -1,8 +1,10 @@
 // ==UserScript==
-// @name         X-Twitter-intercept-Malicious-advertising.user.js
+// @name         X Ad Blocker
+// @name:zh-CN   X 广告拦截
 // @namespace    https://github.com/ShiYuPIay/X-Twitter-intercept-Malicious-advertising/tree/main 
-// @version      1.2.0
-// @description  X/Twitter spam filter, bot detection, ad blocking and scam detection — fixed edition
+// @version      1.3.0
+// @description  Blocks promoted posts, spam, and scams on X/Twitter
+// @description:zh-CN  拦截 X/Twitter 推广、垃圾内容和诈骗帖
 // @author       Via && ShiYuPIay
 // @license      MIT
 // @match        https://x.com/*
@@ -19,7 +21,7 @@
 // ==/UserScript==
 
 /*
- * X Filter 1.2.0: performance-oriented tweet/ad filtering with configurable
+ * X Ad Blocker 1.3.0: performance-oriented tweet/ad filtering with configurable
  * trusted-user rules and an opt-in, page-context sensitive-content fetch patch.
  */
 
@@ -37,6 +39,52 @@
     // ─────────────────────────────────────────────
 
     let CONFIG = { users: [], words: [], regex: [], trustedUsers: [], unlockSensitive: false, debug: false };
+
+    const UI_COPY = {
+        zh: {
+            name: "X 广告拦截",
+            description: "屏蔽推广、垃圾内容和诈骗帖",
+            openSettings: "打开 X 广告拦截设置",
+            blockUsers: "屏蔽用户（每行一个；支持精确用户名或 <code>/正则/</code>）",
+            trustedUsers: "信任用户（每行一个，不会被此脚本隐藏）",
+            keywords: "自定义关键词（每行一个；命中后立即隐藏）",
+            regex: "自定义内容正则（每行一个；格式 <code>/正则/flags</code>，命中后立即隐藏）",
+            sensitive: "尝试修改部分 X API fetch 响应；X 的请求实现变化时可能无效",
+            save: "保存规则", export: "导出规则", reset: "恢复默认",
+            saveFailed: "保存失败：无法写入规则，请检查浏览器存储权限后重试。",
+            resetFailed: "恢复默认失败：无法写入规则，请检查浏览器存储权限后重试。",
+            saved: "规则已保存，当前页面已重新评估。敏感内容拦截开关会在下次页面加载时生效。",
+            ignoredRules: " 已忽略无效正则：",
+            copyFailed: "无法复制规则，请检查剪贴板权限。",
+            copied: "规则已复制到剪贴板",
+            resetConfirm: "恢复默认规则？自定义规则将被清除。"
+        },
+        en: {
+            name: "X Ad Blocker",
+            description: "Blocks promoted posts, spam, and scams",
+            openSettings: "Open X Ad Blocker settings",
+            blockUsers: "Blocked users (one per line; exact username or <code>/regex/</code>)",
+            trustedUsers: "Trusted users (one per line; never hidden by this script)",
+            keywords: "Custom keywords (one per line; matching posts are hidden)",
+            regex: "Custom content regex (one per line; use <code>/pattern/flags</code>)",
+            sensitive: "Try to modify some X API fetch responses; this may stop working if X changes its requests",
+            save: "Save rules", export: "Export rules", reset: "Restore defaults",
+            saveFailed: "Could not save rules. Check browser storage permissions and try again.",
+            resetFailed: "Could not restore defaults. Check browser storage permissions and try again.",
+            saved: "Rules saved and the current page has been reevaluated. The sensitive-content option takes effect on the next page load.",
+            ignoredRules: " Ignored invalid regular expressions: ",
+            copyFailed: "Could not copy rules. Check clipboard permissions.",
+            copied: "Rules copied to the clipboard",
+            resetConfirm: "Restore default rules? Your custom rules will be cleared."
+        }
+    };
+
+    function getUiText(languages = (typeof navigator === "undefined" ? [] : navigator.languages || [navigator.language])) {
+        const locale = languages.find(Boolean) || "";
+        return locale.toLowerCase().startsWith("zh") ? UI_COPY.zh : UI_COPY.en;
+    }
+
+    const UI_TEXT = getUiText();
 
     const Storage = {
         get(key, def) {
@@ -121,7 +169,7 @@
     if (!Array.isArray(CONFIG.regex)) CONFIG.regex = [];
 
     function debugWarn(message, error) {
-        if (CONFIG.debug) console.warn("[X Filter 1.2.0] " + message, error || "");
+        if (CONFIG.debug) console.warn("[X 广告拦截] " + message, error || "");
     }
 
     // ─────────────────────────────────────────────
@@ -385,14 +433,18 @@
         style.textContent = `
             #button {
                 position: fixed; right: 20px; top: 76px;
-                width: 45px; height: 45px; border: 0; border-radius: 50%;
+                min-width: 45px; height: 45px; border: 0; border-radius: 23px;
                 background: #1d9bf0; color: white;
                 display: flex; align-items: center; justify-content: center;
-                cursor: pointer; z-index: 999999; font-size: 20px;
+                gap: 7px; padding: 0 14px 0 11px;
+                cursor: pointer; z-index: 999999; font-size: 13px; font-weight: 700;
                 box-shadow: 0 2px 8px rgba(0,0,0,.3);
                 user-select: none;
             }
             #button:hover { background: #1a8cd8; }
+            #button:focus-visible { outline: 3px solid #80c8f8; outline-offset: 2px; }
+            .brand-icon { width: 22px; height: 22px; flex: 0 0 22px; }
+            .button-label { white-space: nowrap; }
             #panel {
                 display: none; position: fixed;
                 right: 20px; top: 130px; width: 350px; max-width: calc(100vw - 32px);
@@ -413,7 +465,10 @@
                 margin-top: 5px; margin-right: 4px; font-size: 13px;
             }
             button:hover { background: #1a8cd8; }
-            h3 { margin-top: 0; cursor: move; }
+            h3 { margin: 0; cursor: move; }
+            .panel-brand { display: flex; align-items: center; gap: 9px; margin-bottom: 4px; }
+            .panel-brand .brand-icon { color: #1d9bf0; }
+            .panel-subtitle { color: #536471; margin: 0 0 14px; }
             p  { margin: 8px 0 4px; font-size: 13px; }
             #save-status { color: #b42318; font-weight: 600; }
         `;
@@ -421,22 +476,29 @@
 
         const wrap = document.createElement("div");
         wrap.innerHTML = `
-            <button id="button" type="button" aria-label="打开 X Filter 设置" aria-expanded="false">⚙</button>
-            <section id="panel" role="dialog" aria-label="X Filter 设置">
-                <h3 id="title">X Filter 1.2.0</h3>
-                <p>屏蔽用户（每行一个；支持精确用户名或 <code>/正则/</code>）</p>
+            <button id="button" type="button" aria-label="${UI_TEXT.openSettings}" aria-expanded="false">
+                <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4.5 6v5.5c0 4.6 3.1 7.9 7.5 9.5 4.4-1.6 7.5-4.9 7.5-9.5V6L12 3Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>
+                <span class="button-label">${UI_TEXT.name.replace("X ", "")}</span>
+            </button>
+            <section id="panel" role="dialog" aria-label="${UI_TEXT.openSettings}">
+                <div class="panel-brand" id="title">
+                    <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4.5 6v5.5c0 4.6 3.1 7.9 7.5 9.5 4.4-1.6 7.5-4.9 7.5-9.5V6L12 3Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg>
+                    <h3>${UI_TEXT.name}</h3>
+                </div>
+                <p class="panel-subtitle">${UI_TEXT.description}</p>
+                <p>${UI_TEXT.blockUsers}</p>
                 <textarea id="users"></textarea>
-                <p>信任用户（每行一个，不会被此脚本隐藏）</p>
+                <p>${UI_TEXT.trustedUsers}</p>
                 <textarea id="trusted-users"></textarea>
-                <p>自定义关键词（每行一个；命中后立即隐藏）</p>
+                <p>${UI_TEXT.keywords}</p>
                 <textarea id="words"></textarea>
-                <p>自定义内容正则（每行一个；格式 <code>/正则/flags</code>，命中后立即隐藏）</p>
+                <p>${UI_TEXT.regex}</p>
                 <textarea id="regex"></textarea>
-                <p><label><input id="unlock-sensitive" type="checkbox"> 尝试修改部分 X API fetch 响应；X 的请求实现变化时可能无效</label></p>
+                <p><label><input id="unlock-sensitive" type="checkbox"> ${UI_TEXT.sensitive}</label></p>
                 <div>
-                    <button id="save">保存规则</button>
-                    <button id="export">导出规则</button>
-                    <button id="reset">恢复默认</button>
+                    <button id="save">${UI_TEXT.save}</button>
+                    <button id="export">${UI_TEXT.export}</button>
+                    <button id="reset">${UI_TEXT.reset}</button>
                 </div>
                 <p id="save-status" role="status" aria-live="polite" hidden></p>
             </section>
@@ -488,33 +550,33 @@
             CONFIG.unlockSensitive = unlockSensitiveCheckbox.checked;
             const invalidRules = reloadUserRules();
             if (!Storage.set("XFilterConfig", CONFIG)) {
-                showSaveStatus("保存失败：无法写入规则，请检查浏览器存储权限后重试。");
+                showSaveStatus(UI_TEXT.saveFailed);
                 return;
             }
             showSaveStatus("");
             reevaluateTweets();
-            const suffix = invalidRules.length ? " 已忽略无效正则：" + invalidRules.join("、") : "";
-            alert("规则已保存，当前页面已重新评估。敏感内容拦截开关会在下次页面加载时生效。" + suffix);
+            const suffix = invalidRules.length ? UI_TEXT.ignoredRules + invalidRules.join("、") : "";
+            alert(UI_TEXT.saved + suffix);
         };
 
         shadow.querySelector("#export").onclick = async () => {
             try {
                 if (!await Storage.copy(JSON.stringify(CONFIG, null, 2))) {
-                    alert("无法复制规则，请检查剪贴板权限。");
+                    alert(UI_TEXT.copyFailed);
                     return;
                 }
-                alert("规则已复制到剪贴板");
+                alert(UI_TEXT.copied);
             } catch (error) {
                 debugWarn("Could not copy rules", error);
-                alert("无法复制规则，请检查剪贴板权限。");
+                alert(UI_TEXT.copyFailed);
             }
         };
 
         shadow.querySelector("#reset").onclick = () => {
-            if (confirm("恢复默认规则？自定义规则将被清除。")) {
+            if (confirm(UI_TEXT.resetConfirm)) {
                 CONFIG = { users: [], words: [], regex: [], trustedUsers: [], unlockSensitive: false, debug: false };
                 if (!Storage.set("XFilterConfig", CONFIG)) {
-                    showSaveStatus("恢复默认失败：无法写入规则，请检查浏览器存储权限后重试。");
+                    showSaveStatus(UI_TEXT.resetFailed);
                     return;
                 }
                 location.reload();
@@ -555,7 +617,7 @@
         initialScan();
         startObserver();
         console.log(
-            "%c X Filter 1.2.0 Loaded ",
+            "%c X 广告拦截 1.3.0 已加载 ",
             "background:#1d9bf0;color:white;padding:5px;border-radius:4px"
         );
     }
