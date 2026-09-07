@@ -6,8 +6,9 @@ const path = require('node:path');
 const test = require('node:test');
 
 class FixtureNode {
-    constructor({ testid, ariaLabel = '', text = '', children = [] } = {}) {
+    constructor({ testid, ariaLabel = '', text = '', children = [], throwSelectors = [] } = {}) {
         this.testid = testid;
+        this.throwSelectors = new Set(throwSelectors);
         this.ariaLabel = ariaLabel;
         this.textContent = text;
         this.children = children;
@@ -33,6 +34,7 @@ class FixtureNode {
     }
 
     querySelectorAll(selector) {
+        if (this.throwSelectors.has(selector)) throw new Error(`Invalid selector: ${selector}`);
         return this.children.flatMap(child => [
             ...(child.matches(selector) ? [child] : []),
             ...child.querySelectorAll(selector)
@@ -59,7 +61,9 @@ function adDetectionFixture(debug = false) {
     return {
         detection: createDetection(
             value => String(value || '').replace(/[\u200B-\u200F\uFEFF\u2060]/g, '').trim(),
-            (...args) => logs.push(args)
+            (...args) => {
+                if (debug) logs.push(args);
+            }
         ),
         logs
     };
@@ -118,4 +122,58 @@ test('does not hide an ordinary tweet merely because its text says Promoted', ()
     adDetectionFixture().detection.cleanAds(root);
 
     assert.equal(tweet.parent.style.display, undefined);
+});
+
+
+test('continues social-context detection after an ad selector fails and only logs in debug mode', () => {
+    const selector = '[data-testid="placementTracking"]';
+    const createRoot = () => {
+        const context = new FixtureNode({ testid: 'socialContext', ariaLabel: 'Promoted' });
+        return { context, root: new FixtureNode({ children: [cell(context)], throwSelectors: [selector] }) };
+    };
+
+    const normalFixture = createRoot();
+    const normal = adDetectionFixture();
+    normal.detection.cleanAds(normalFixture.root);
+    assert.equal(normalFixture.context.parent.style.display, 'none');
+    assert.deepEqual(normal.logs, []);
+
+    const debugFixture = createRoot();
+    const debug = adDetectionFixture(true);
+    debug.detection.cleanAds(debugFixture.root);
+    assert.equal(debugFixture.context.parent.style.display, 'none');
+    assert.equal(debug.logs.length, 1);
+    assert.match(debug.logs[0][0], /Could not apply ad selector/);
+    assert.equal(debug.logs[0][1] instanceof Error, true);
+});
+
+test('storage write failures return false and include the operation, key, and error in debug logs', () => {
+    const source = fs.readFileSync(
+        path.join(__dirname, '..', 'X-Twitter-intercept-Malicious-advertising.user.js'),
+        'utf8'
+    );
+    const storageStart = source.indexOf('    const Storage =');
+    const storageEnd = source.indexOf('    // ─────────────────────────────────────────────\n    //  Default filter rules', storageStart);
+    const warnings = [];
+    const createStorage = new Function('GM_getValue', 'GM_setValue', 'GM_setClipboard', 'localStorage', 'navigator', 'console', `
+        let CONFIG = { debug: true };
+        function debugWarn(message, error) {
+            if (CONFIG.debug) console.warn(message, error);
+        }
+        ${source.slice(storageStart, storageEnd)}
+        return Storage;
+    `);
+    const writeError = new Error('Storage quota exceeded');
+    const storage = createStorage(
+        undefined,
+        undefined,
+        undefined,
+        { getItem: () => null, setItem: () => { throw writeError; } },
+        {},
+        { warn: (...args) => warnings.push(args) }
+    );
+
+    assert.equal(storage.set('XFilterConfig', { users: [] }), false);
+    assert.match(warnings[0][0], /Storage\.set failed for key: XFilterConfig/);
+    assert.equal(warnings[0][1], writeError);
 });

@@ -32,27 +32,41 @@
     //  Storage API
     // ─────────────────────────────────────────────
 
+    let CONFIG = { users: [], words: [], regex: [], trustedUsers: [], unlockSensitive: false, debug: false };
+
     const Storage = {
         get(key, def) {
             try {
                 if (typeof GM_getValue === "function") return GM_getValue(key, def);
-                const v = localStorage.getItem(key);
-                return v ? JSON.parse(v) : def;
-            } catch (e) { return def; }
+                const value = localStorage.getItem(key);
+                return value ? JSON.parse(value) : def;
+            } catch (error) {
+                debugWarn("Storage.get failed for key: " + key, error);
+                return def;
+            }
         },
         set(key, value) {
             try {
                 if (typeof GM_setValue === "function") GM_setValue(key, value);
                 else localStorage.setItem(key, JSON.stringify(value));
-            } catch (e) {}
+                return true;
+            } catch (error) {
+                debugWarn("Storage.set failed for key: " + key, error);
+                return false;
+            }
         },
         async copy(text) {
-            if (typeof GM_setClipboard === "function") {
-                GM_setClipboard(text);
+            try {
+                if (typeof GM_setClipboard === "function") {
+                    GM_setClipboard(text);
+                } else {
+                    await navigator.clipboard.writeText(text);
+                }
                 return true;
+            } catch (error) {
+                debugWarn("Storage.copy failed for key: clipboard", error);
+                return false;
             }
-            await navigator.clipboard.writeText(text);
-            return true;
         }
     };
 
@@ -95,10 +109,7 @@
     //  User config
     // ─────────────────────────────────────────────
 
-    let CONFIG = Object.assign(
-        { users: [], words: [], regex: [], trustedUsers: [], unlockSensitive: false, debug: false },
-        Storage.get("XFilterConfig", {})
-    );
+    CONFIG = Object.assign(CONFIG, Storage.get("XFilterConfig", {}));
     // Remove fields from old releases that were never implemented.
     delete CONFIG.disabledUsers;
     delete CONFIG.disabledWords;
@@ -551,7 +562,9 @@
             try {
                 if (root && root.matches && root.matches(selector)) hideAdNode(root);
                 search.querySelectorAll(selector).forEach(hideAdNode);
-            } catch (e) {}
+            } catch (error) {
+                debugWarn("Could not apply ad selector: " + selector, error);
+            }
         }
 
         // Only inspect social-context nodes. Never infer ads from arbitrary
@@ -689,6 +702,7 @@
             button:hover { background: #1a8cd8; }
             h3 { margin-top: 0; cursor: move; }
             p  { margin: 8px 0 4px; font-size: 13px; }
+            #save-status { color: #b42318; font-weight: 600; }
         `;
         shadow.appendChild(style);
 
@@ -711,6 +725,7 @@
                     <button id="export">导出规则</button>
                     <button id="reset">恢复默认</button>
                 </div>
+                <p id="save-status" role="status" aria-live="polite" hidden></p>
             </section>
         `;
         shadow.appendChild(wrap);
@@ -722,6 +737,12 @@
         const words = shadow.querySelector("#words");
         const regex = shadow.querySelector("#regex");
         const unlockSensitiveCheckbox = shadow.querySelector("#unlock-sensitive");
+        const saveStatus = shadow.querySelector("#save-status");
+
+        function showSaveStatus(message) {
+            saveStatus.textContent = message;
+            saveStatus.hidden = !message;
+        }
 
         users.value = CONFIG.users.join("\n");
         trustedUsers.value = (CONFIG.trustedUsers || []).join("\n");
@@ -753,7 +774,11 @@
             CONFIG.regex = regex.value.split("\n").map(x => x.trim()).filter(Boolean);
             CONFIG.unlockSensitive = unlockSensitiveCheckbox.checked;
             const invalidRules = reloadUserRules();
-            Storage.set("XFilterConfig", CONFIG);
+            if (!Storage.set("XFilterConfig", CONFIG)) {
+                showSaveStatus("保存失败：无法写入规则，请检查浏览器存储权限后重试。");
+                return;
+            }
+            showSaveStatus("");
             Keyword.reload();
             reevaluateTweets();
             const suffix = invalidRules.length ? " 已忽略无效正则：" + invalidRules.join("、") : "";
@@ -762,7 +787,10 @@
 
         shadow.querySelector("#export").onclick = async () => {
             try {
-                await Storage.copy(JSON.stringify(CONFIG, null, 2));
+                if (!await Storage.copy(JSON.stringify(CONFIG, null, 2))) {
+                    alert("无法复制规则，请检查剪贴板权限。");
+                    return;
+                }
                 alert("规则已复制到剪贴板");
             } catch (error) {
                 debugWarn("Could not copy rules", error);
@@ -773,7 +801,10 @@
         shadow.querySelector("#reset").onclick = () => {
             if (confirm("恢复默认规则？自定义规则将被清除。")) {
                 CONFIG = { users: [], words: [], regex: [], trustedUsers: [], unlockSensitive: false, debug: false };
-                Storage.set("XFilterConfig", CONFIG);
+                if (!Storage.set("XFilterConfig", CONFIG)) {
+                    showSaveStatus("恢复默认失败：无法写入规则，请检查浏览器存储权限后重试。");
+                    return;
+                }
                 location.reload();
             }
         };
