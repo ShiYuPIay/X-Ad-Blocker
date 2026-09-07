@@ -493,23 +493,55 @@
     // ─────────────────────────────────────────────
     //  Ad cleaning
     //  FIX 1: "article:has(span)" matched virtually every tweet — replaced with
-    //          targeted aria-label / data-testid selectors.
+    //          targeted data-testid selectors and scoped social-context labels.
     //  FIX 2: was driven by setInterval(3000); moved into the MutationObserver
     //          so ads are hidden as soon as they appear, with zero polling cost.
     // ─────────────────────────────────────────────
 
-    const AD_SELECTORS = [
-        '[data-testid="placementTracking"]',
-        '[data-testid="socialContext"][aria-label="Promoted"]',
-        '[data-testid="socialContext"][aria-label="广告"]',
-        '[data-testid="socialContext"][aria-label="Sponsored"]'
-    ];
+    // These selectors identify X's stable ad container structure. Keep text
+    // matching out of this list: UI copy is localized and changes independently.
+    const AD_SELECTORS = Object.freeze([
+        '[data-testid="placementTracking"]'
+    ]);
+
+    const SOCIAL_CONTEXT_SELECTOR = '[data-testid="socialContext"]';
+    const PROMOTED_SOCIAL_CONTEXT_LABELS = new Set([
+        "promoted", "sponsored", "广告", "推廣", "推广", "広告",
+        "patrocinado", "publicité", "gesponsert"
+    ]);
+
+    function normalizeSocialContextLabel(value) {
+        return cleanText(value || "").replace(/\s+/g, " ").toLowerCase();
+    }
+
+    function getSocialContextLabels(context) {
+        return [context.getAttribute("aria-label"), context.textContent]
+            .map(normalizeSocialContextLabel)
+            .filter(Boolean);
+    }
+
+    function isPromotedSocialContext(context) {
+        return getSocialContextLabels(context)
+            .some(label => PROMOTED_SOCIAL_CONTEXT_LABELS.has(label));
+    }
 
     function hideAdNode(el) {
         const container = el.closest('[data-testid="cellInnerDiv"]') || el;
         if (!container.dataset.xAdFiltered) {
             container.dataset.xAdFiltered = "true";
             container.style.display = "none";
+        }
+    }
+
+    function inspectSocialContext(context) {
+        if (isPromotedSocialContext(context)) {
+            hideAdNode(context);
+        } else if (CONFIG.debug && !context.dataset.xAdSocialContextDiagnosed) {
+            context.dataset.xAdSocialContextDiagnosed = "true";
+            debugWarn("Unrecognized social context label", {
+                ariaLabel: normalizeSocialContextLabel(context.getAttribute("aria-label")),
+                text: normalizeSocialContextLabel(context.textContent)
+            });
         }
     }
 
@@ -521,6 +553,11 @@
                 search.querySelectorAll(selector).forEach(hideAdNode);
             } catch (e) {}
         }
+
+        // Only inspect social-context nodes. Never infer ads from arbitrary
+        // tweet text, which would risk hiding ordinary posts that mention ads.
+        if (root && root.matches && root.matches(SOCIAL_CONTEXT_SELECTOR)) inspectSocialContext(root);
+        search.querySelectorAll(SOCIAL_CONTEXT_SELECTOR).forEach(inspectSocialContext);
     }
 
     // ─────────────────────────────────────────────
